@@ -20,7 +20,7 @@ from scipy import ndimage
 from scipy.linalg import eigh
 import json
 
-import dino
+from maskcut import dino
 # modfied by Xudong Wang based on third_party/TokenCut
 sys.path.append('../')
 sys.path.append('../third_party')
@@ -29,7 +29,7 @@ from TokenCut.unsupervised_saliency_detection.object_discovery import detect_box
 # bilateral_solver codes are modfied based on https://github.com/poolio/bilateral_solver/blob/master/notebooks/bilateral_solver.ipynb
 # from TokenCut.unsupervised_saliency_detection.bilateral_solver import BilateralSolver, BilateralGrid
 # crf codes are are modfied based on https://github.com/lucasb-eyer/pydensecrf/blob/master/pydensecrf/tests/test_dcrf.py
-from crf import densecrf
+import pydensecrf.densecrf as densecrf
 
 # Image transformation applied to all images
 ToTensor = transforms.Compose([transforms.ToTensor(),
@@ -78,7 +78,65 @@ def get_masked_affinity_matrix(painting, feats, mask, ps):
     feats = ((1 - painting) * feats).view(dim, num_patch)
     return feats, painting
 
-def maskcut_forward(feats, dims, scales, init_image_size, tau=0, N=3, cpu=False):
+def get_segment_from_affinity(A, pt, dims, init_image_size, method="spectral"):
+    """
+    Extract a segment from the affinity matrix using a seed point.
+
+    Args:
+        A: Affinity matrix
+        pt: Seed point (x, y) in original image coordinates
+        dims: Dimensions of the feature map
+        init_image_size: Original image size
+        method: Segmentation method ("spectral", "random_walk", or "threshold")
+
+    Returns:
+        Binary segmentation mask at original image resolution
+    """
+    # Map point to feature space index
+    fixed_size = init_image_size[0]
+    patch_size = 8
+    x, y = pt
+    x_upsampled = int(x * (fixed_size / 256))
+    y_upsampled = int(y * (fixed_size / 256))
+    patch_x = x_upsampled // patch_size
+    patch_y = y_upsampled // patch_size
+    patch_idx = patch_y * (dims[1]) + patch_x
+
+    if method == "spectral":
+        # Use spectral clustering with seed point as constraint
+        D = np.diag(np.sum(A, axis=1))
+        L = D - A  # Laplacian matrix
+
+        # Create indicator vector for the seed point
+        indicator = np.zeros(A.shape[0])
+        indicator[patch_idx] = 1
+
+        # Solve for the second smallest eigenvector of the Laplacian
+        # with the constraint that the seed point belongs to the foreground
+        D_sqrt_inv = np.diag(1.0 / np.sqrt(np.diag(D) + 1e-10))
+        L_sym = D_sqrt_inv @ L @ D_sqrt_inv
+
+        # Add a small regularization to make seed point special
+        alpha = 0.1
+        L_reg = L_sym + alpha * np.outer(indicator, indicator)
+
+        # Get the eigenvector corresponding to the second smallest eigenvalue
+        eigvals, eigvecs = np.linalg.eigh(L_reg)
+        second_smallest = np.argsort(eigvals)[1]
+        fiedler_vec = eigvecs[:, second_smallest]
+
+        # Threshold to get binary segmentation
+        mask = fiedler_vec > 0
+
+    # Reshape mask to feature map dimensions and upsample
+    mask_reshaped = mask.reshape(dims)
+    mask_tensor = torch.from_numpy(mask_reshaped).float().unsqueeze(0).unsqueeze(0)
+    mask_upsampled = F.interpolate(mask_tensor, size=(fixed_size, fixed_size),
+                                  mode='bilinear', align_corners=False)
+
+    return mask_upsampled.squeeze().numpy() > 0.5
+
+def maskcut_forward(feats, dims, scales, init_image_size, tau=0, N=3, cpu=False, pt=None, attention=False):
     """
     Implementation of MaskCut.
     Inputs
@@ -101,6 +159,29 @@ def maskcut_forward(feats, dims, scales, init_image_size, tau=0, N=3, cpu=False)
 
         # construct the affinity matrix
         A, D = get_affinity_matrix(feats, tau)
+
+        if attention:
+            #segment = get_segment_from_affinity(A, pt, dims, init_image_size, method="spectral")
+            #breakpoint()
+            #return segment
+            fixed_size = init_image_size[0]
+            patch_size = 8
+            x, y = pt
+            x_upsampled = int(x * (fixed_size / 256))
+            y_upsampled = int(y * (fixed_size / 256))
+            patch_x = x_upsampled // patch_size
+            patch_y = y_upsampled // patch_size
+            patch_idx = patch_y * 60 + patch_x
+
+            cls_attention = A[patch_idx].reshape(dims)
+            cls_attention = torch.from_numpy(cls_attention).unsqueeze(0).unsqueeze(0).float()
+
+            heatmap = F.interpolate(cls_attention, size=(fixed_size, fixed_size), mode='bilinear', align_corners=False)
+            heatmap = heatmap.reshape(fixed_size,fixed_size).cpu().numpy()
+            heatmap_normalized = (heatmap - np.min(heatmap)) / (np.max(heatmap) - np.min(heatmap))
+
+            return heatmap_normalized
+
         # get the second smallest eigenvector
         eigenvec, second_smallest_vec = second_smallest_eigenvector(A, D)
         # get salient area
@@ -155,9 +236,9 @@ def maskcut_forward(feats, dims, scales, init_image_size, tau=0, N=3, cpu=False)
         eigvec = F.interpolate(eigvec.unsqueeze(0).unsqueeze(0), size=init_image_size, mode='nearest').squeeze()
         eigvecs.append(eigvec.cpu().numpy())
 
-    return seed, bipartitions, eigvecs
+    return seed, bipartitions, eigvecs, None
 
-def maskcut(img_path, backbone,patch_size, tau, N=1, fixed_size=480, cpu=False) :
+def maskcut(img_path, backbone,patch_size, tau, N=1, fixed_size=480, cpu=False, pt=None, attention=False) :
     I = Image.open(img_path).convert('RGB')
     bipartitions, eigvecs = [], []
 
@@ -168,12 +249,17 @@ def maskcut(img_path, backbone,patch_size, tau, N=1, fixed_size=480, cpu=False) 
     if not cpu: tensor = tensor.cuda()
     feat = backbone(tensor)[0]
 
-    _, bipartition, eigvec = maskcut_forward(feat, [feat_h, feat_w], [patch_size, patch_size], [h,w], tau, N=N, cpu=cpu)
+    if attention:
+        attention_map = maskcut_forward(feat, [feat_h, feat_w], [patch_size, patch_size], [h,w], tau, N=N, cpu=cpu, pt=pt, attention=attention)
+        return None, None, I_new, attention_map
+
+    else:
+        _, bipartition, eigvec, _ = maskcut_forward(feat, [feat_h, feat_w], [patch_size, patch_size], [h,w], tau, N=N, cpu=cpu, pt=pt, attention=attention)
 
     bipartitions += bipartition
     eigvecs += eigvec
 
-    return bipartitions, eigvecs, I_new
+    return bipartitions, eigvecs, I_new, None
 
 def resize_binary_mask(array, new_size):
     image = Image.fromarray(array.astype(np.uint8)*255)
