@@ -19,6 +19,7 @@ import pycocotools.mask as mask_util
 from scipy import ndimage
 from scipy.linalg import eigh
 import json
+from promerge.utils import plot_masks, resize_pil, IoU, check_num_fg_sides, dino_similarity
 
 from maskcut import dino
 # modfied by Xudong Wang based on third_party/TokenCut
@@ -29,7 +30,8 @@ from TokenCut.unsupervised_saliency_detection.object_discovery import detect_box
 # bilateral_solver codes are modfied based on https://github.com/poolio/bilateral_solver/blob/master/notebooks/bilateral_solver.ipynb
 # from TokenCut.unsupervised_saliency_detection.bilateral_solver import BilateralSolver, BilateralGrid
 # crf codes are are modfied based on https://github.com/lucasb-eyer/pydensecrf/blob/master/pydensecrf/tests/test_dcrf.py
-import pydensecrf.densecrf as densecrf
+# import pydensecrf.densecrf as densecrf
+from promerge.crf import densecrf
 
 # Image transformation applied to all images
 ToTensor = transforms.Compose([transforms.ToTensor(),
@@ -78,65 +80,16 @@ def get_masked_affinity_matrix(painting, feats, mask, ps):
     feats = ((1 - painting) * feats).view(dim, num_patch)
     return feats, painting
 
-def get_segment_from_affinity(A, pt, dims, init_image_size, method="spectral"):
-    """
-    Extract a segment from the affinity matrix using a seed point.
+def calculate_affinity_matrix(dino_features: torch.tensor, seed: torch.tensor, eps=1e-5):
+    """Inner product between seed feature and every feature in DINO"""
+    seed = seed.unsqueeze(-1).unsqueeze(-1)
+    dino_features = dino_features / (torch.linalg.norm(dino_features, axis=0) + eps)
+    seed = seed / (torch.linalg.norm(seed, axis=0) + eps)
+    affinity = (dino_features * seed).sum(dim=0)
+    assert affinity.shape == dino_features.shape[1:]
+    return affinity
 
-    Args:
-        A: Affinity matrix
-        pt: Seed point (x, y) in original image coordinates
-        dims: Dimensions of the feature map
-        init_image_size: Original image size
-        method: Segmentation method ("spectral", "random_walk", or "threshold")
-
-    Returns:
-        Binary segmentation mask at original image resolution
-    """
-    # Map point to feature space index
-    fixed_size = init_image_size[0]
-    patch_size = 8
-    x, y = pt
-    x_upsampled = int(x * (fixed_size / 256))
-    y_upsampled = int(y * (fixed_size / 256))
-    patch_x = x_upsampled // patch_size
-    patch_y = y_upsampled // patch_size
-    patch_idx = patch_y * (dims[1]) + patch_x
-
-    if method == "spectral":
-        # Use spectral clustering with seed point as constraint
-        D = np.diag(np.sum(A, axis=1))
-        L = D - A  # Laplacian matrix
-
-        # Create indicator vector for the seed point
-        indicator = np.zeros(A.shape[0])
-        indicator[patch_idx] = 1
-
-        # Solve for the second smallest eigenvector of the Laplacian
-        # with the constraint that the seed point belongs to the foreground
-        D_sqrt_inv = np.diag(1.0 / np.sqrt(np.diag(D) + 1e-10))
-        L_sym = D_sqrt_inv @ L @ D_sqrt_inv
-
-        # Add a small regularization to make seed point special
-        alpha = 0.1
-        L_reg = L_sym + alpha * np.outer(indicator, indicator)
-
-        # Get the eigenvector corresponding to the second smallest eigenvalue
-        eigvals, eigvecs = np.linalg.eigh(L_reg)
-        second_smallest = np.argsort(eigvals)[1]
-        fiedler_vec = eigvecs[:, second_smallest]
-
-        # Threshold to get binary segmentation
-        mask = fiedler_vec > 0
-
-    # Reshape mask to feature map dimensions and upsample
-    mask_reshaped = mask.reshape(dims)
-    mask_tensor = torch.from_numpy(mask_reshaped).float().unsqueeze(0).unsqueeze(0)
-    mask_upsampled = F.interpolate(mask_tensor, size=(fixed_size, fixed_size),
-                                  mode='bilinear', align_corners=False)
-
-    return mask_upsampled.squeeze().numpy() > 0.5
-
-def maskcut_forward(feats, dims, scales, init_image_size, tau=0, N=3, cpu=False, pt=None, attention=False):
+def maskcut_forward(feats, dims, scales, init_image_size, tau=0, N=3, cpu=False, pt=None, attention=False, img=None, backbone=None):
     """
     Implementation of MaskCut.
     Inputs
@@ -161,24 +114,86 @@ def maskcut_forward(feats, dims, scales, init_image_size, tau=0, N=3, cpu=False,
         A, D = get_affinity_matrix(feats, tau)
 
         if attention:
-            #segment = get_segment_from_affinity(A, pt, dims, init_image_size, method="spectral")
-            #breakpoint()
-            #return segment
-            fixed_size = init_image_size[0]
-            patch_size = 8
-            x, y = pt
-            x_upsampled = int(x * (fixed_size / 256))
-            y_upsampled = int(y * (fixed_size / 256))
-            patch_x = x_upsampled // patch_size
-            patch_y = y_upsampled // patch_size
-            patch_idx = patch_y * 60 + patch_x
+            bipartition_tau=0.2
 
-            cls_attention = A[patch_idx].reshape(dims)
-            cls_attention = torch.from_numpy(cls_attention).unsqueeze(0).unsqueeze(0).float()
+            # Ensure image is in PIL format for ProMERGE processing
+            image_pil = img
 
-            heatmap = F.interpolate(cls_attention, size=(fixed_size, fixed_size), mode='bilinear', align_corners=False)
-            heatmap = heatmap.reshape(fixed_size,fixed_size).cpu().numpy()
-            heatmap_normalized = (heatmap - np.min(heatmap)) / (np.max(heatmap) - np.min(heatmap))
+            # Store original dimensions
+            image_width, image_height = image_pil.width, image_pil.height
+
+            # Resize image to fixed size for DINO
+            resized_image = image_pil.resize((480, 480), Image.LANCZOS)
+            resized_image, _, _, feat_w, feat_h = resize_pil(resized_image, 8)
+
+            # Convert to tensor for DINO
+            to_tensor = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+                ])
+            image_tensor = to_tensor(resized_image).unsqueeze(0).to('cuda:0')
+
+            # Get DINO features
+            dino_features_raw = backbone(image_tensor)[0]
+            dino_features = dino_features_raw.reshape((dino_features_raw.shape[0], feat_w, feat_h)).detach()
+
+            # Generate seed features from the point
+            # Scale point to feature map coordinates
+            seed_x = int(pt[1] * feat_w / image_width)
+            seed_y = int(pt[0] * feat_h / image_height)
+
+            # Make sure coordinates are in bounds
+            seed_x = max(0, min(seed_x, feat_w - 1))
+            seed_y = max(0, min(seed_y, feat_h - 1))
+
+            # Generate affinity from seed
+            seed_feature = dino_features[:, seed_x, seed_y]
+            normalized_affinity = calculate_affinity_matrix(dino_features, seed_feature)
+
+            # Create mask from affinity
+            masked_affinity = (normalized_affinity > bipartition_tau).float()
+
+            # Clean up the mask with connected components
+            objects_ccs, n_ccs = ndimage.label(masked_affinity.cpu().numpy())
+
+            # Get the component containing the seed point
+            seed_component = objects_ccs[seed_x, seed_y]
+            if seed_component == 0:  # If seed point is in background
+                largest_cc = 1
+                for i in range(1, n_ccs + 1):
+                    if np.sum(objects_ccs == i) > np.sum(objects_ccs == largest_cc):
+                        largest_cc = i
+                seed_component = largest_cc
+
+            # Extract the mask
+            mask = np.zeros_like(objects_ccs)
+            mask[objects_ccs == seed_component] = 1
+
+            # Convert to tensor
+            mask = torch.from_numpy(mask).to('cuda:0')
+
+            # Upsample to original size
+            mask_upsampled = F.interpolate(
+                mask.unsqueeze(0).unsqueeze(0).float(),
+                size=(480, 480),
+                mode='nearest'
+            ).squeeze()
+
+            # Apply CRF refinement
+            mask_np = np.float32(mask_upsampled.cpu() >= 1)
+            mask_crf = densecrf(np.array(resized_image), mask_np)
+            mask_crf = ndimage.binary_fill_holes(mask_crf >= 0.5)
+
+            # Resize back to original dimensions
+            mask_final = np.uint8(mask_crf * 255)
+            mask_final = Image.fromarray(mask_final)
+            mask_final = np.asarray(mask_final.resize((image_width, image_height)))
+
+            # Binarize the final mask
+            final_mask = (mask_final > 127).astype(np.uint8)
+            breakpoint()
+
+            return final_mask
 
             return heatmap_normalized
 
@@ -250,7 +265,7 @@ def maskcut(img_path, backbone,patch_size, tau, N=1, fixed_size=480, cpu=False, 
     feat = backbone(tensor)[0]
 
     if attention:
-        attention_map = maskcut_forward(feat, [feat_h, feat_w], [patch_size, patch_size], [h,w], tau, N=N, cpu=cpu, pt=pt, attention=attention)
+        attention_map = maskcut_forward(feat, [feat_h, feat_w], [patch_size, patch_size], [h,w], tau, N=N, cpu=cpu, pt=pt, attention=attention, img=I, backbone=backbone)
         return None, None, I_new, attention_map
 
     else:
